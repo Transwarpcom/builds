@@ -12,7 +12,8 @@ jobs:
       DK_USER: /bld/user
       DK_PROFILE: /bld/user/current
       GH_TOKEN: ${{ github.token }}
-      IMG_INC: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ matrix.target }}-inc
+      # GHCR repository names must be lowercase; the account name contains capitals.
+      IMG_INC: ghcr.io/transwarpcom/${{ github.event.repository.name }}:${{ matrix.target }}-inc
     steps:
     - uses: actions/checkout@v7
 
