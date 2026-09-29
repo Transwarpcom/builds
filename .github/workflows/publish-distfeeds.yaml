@@ -7,18 +7,22 @@ on:
     # Every hour — checks kmods page and only runs full extraction if updated
     - cron: '42 * * * *'
   workflow_dispatch:
-permissions: write-all
+permissions:
+  contents: read
+  actions: write
+  pages: write
+  id-token: write
 env:
   GH_TOKEN: ${{ github.token }}
 jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check for kmods update
         id: check
         run: |
-          LATEST_KMOD=$(curl -sL https://downloads.openwrt.org/snapshots/targets/airoha/an7581/kmods/ | \
+          LATEST_KMOD=$(curl --fail --show-error --silent --location --retry 3 https://downloads.openwrt.org/snapshots/targets/airoha/an7581/kmods/ | \
             grep '<tr>' | \
             grep 'href="' | \
             while read line; do
@@ -28,13 +32,13 @@ jobs:
               echo "$epoch $dir"
             done | \
             sort -rn | \
-            head -1 | \
-            awk '{print $2}')
+            awk 'NR == 1 {print $2}')
+          [[ $LATEST_KMOD =~ ^[A-Za-z0-9._-]+$ ]] || { echo '::error::No valid kmod version found'; exit 1; }
           echo "kmod_version=$LATEST_KMOD" >> "$GITHUB_OUTPUT"
 
       - name: Restore cached kmod version
         id: cache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .kmod_version
           key: kmod-${{ steps.check.outputs.kmod_version }}
@@ -48,7 +52,8 @@ jobs:
       - name: Download and extract
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          curl -L https://downloads.openwrt.org/snapshots/targets/airoha/an7581/openwrt-airoha-an7581-airoha_an7581-evb-squashfs-sysupgrade.bin --output sysupgrade.bin
+          curl --fail --show-error --silent --location --retry 3 https://downloads.openwrt.org/snapshots/targets/airoha/an7581/openwrt-airoha-an7581-airoha_an7581-evb-squashfs-sysupgrade.bin --output sysupgrade.bin
+          test -s sysupgrade.bin
           binwalk -e sysupgrade.bin
 
       - name: Prepare artifact for GitHub Pages
@@ -56,21 +61,26 @@ jobs:
         run: |
           mkdir -p _site
           cp _sysupgrade.bin.extracted/squashfs-root/etc/apk/repositories.d/distfeeds.list _site/
-          sed -n 's/.*6.18.*-*-\([^/]*\).*/\1/p' _site/distfeeds.list 2>/dev/null > _site/vermagic.txt
+          test -s _site/distfeeds.list
+          vermagic=$(printf '%s\n' '${{ steps.check.outputs.kmod_version }}' | sed -nE 's/.*-([0-9a-f]{32})$/\1/p')
+          [[ $vermagic =~ ^[0-9a-f]{32}$ ]] || { echo '::error::Invalid kmod vermagic'; exit 1; }
+          grep -Fq -- "-${vermagic}/packages.adb" _site/distfeeds.list || { echo '::error::Downloaded firmware has a different kmod version'; exit 1; }
+          printf '%s\n' "$vermagic" > _site/vermagic.txt
+          (cd _site && sha256sum distfeeds.list vermagic.txt > SHA256SUMS)
 
       - name: Upload Pages artifact
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: _site
 
       - name: Deploy to GitHub Pages
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
 
       - name: Upload artifact
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           path: _site/distfeeds.list
           archive: false

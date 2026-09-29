@@ -5,7 +5,7 @@ on:
     - cron: '22 * * * *'
   workflow_dispatch:
 
-permissions: {actions: write, contents: write}
+permissions: {actions: write, contents: read}
 
 env:
   REMOTE_REPOSITORY: OpenWRT-fanboy/OpenW1700k
@@ -24,7 +24,7 @@ jobs:
 
       - name: Cache openwrt head SHA
         id: cache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .openwrt_head_sha
           key: openwrt-head-${{ steps.check.outputs.head_sha }}
@@ -64,7 +64,7 @@ jobs:
     environment: ${{ matrix.environment }}
     steps:
       - name: Checkout remote repository
-        uses: actions/checkout@main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ env.REMOTE_REPOSITORY }}
           ref: ${{ matrix.environment }}

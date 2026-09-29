@@ -1,0 +1,131 @@
+diff --git a/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense b/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
+--- a/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
++++ b/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
+@@ -584,6 +584,25 @@
+ 	printf '{"result":"ok","enabled":%d}' "$enabled"
+ }
+ 
++# Prefer the main-table default route over a logical WAN that may not be the active exit.
++# The main table avoids mistaking Nikki policy-routing tables for the physical uplink.
++get_uplink_device() {
++	local routed_device wan_status wan_up wan_ip wan_ip6 l3_device
++	routed_device=$(ip -4 route show table main default 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i=="dev") { d=$(i+1); if (d!="lo" && d!="br-lan" && d !~ /^ifb/ && d !~ /^(nikki|mihomo)/) { print d; exit } } }')
++	if [ -n "$routed_device" ]; then
++		echo "$routed_device"
++		return
++	fi
++	wan_status=$(ubus call network.interface.wan status 2>/dev/null)
++	wan_up=$(echo "$wan_status" | jsonfilter -e "@.up" 2>/dev/null)
++	l3_device=$(echo "$wan_status" | jsonfilter -e "@.l3_device" 2>/dev/null)
++	wan_ip=$(echo "$wan_status" | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
++	wan_ip6=$(echo "$wan_status" | jsonfilter -e "@['ipv6-address'][0].address" 2>/dev/null)
++	if [ "$wan_up" = "true" ] && [ -n "$l3_device" ] && { [ -n "$wan_ip" ] || [ -n "$wan_ip6" ]; }; then
++		echo "$l3_device"
++	fi
++}
++
+ get_device_mode() {
+ 	local mode="router"
+ 	local reason=""
+@@ -598,10 +617,12 @@
+ 
+ 	# Secondary check: is the WAN interface up with a real IP?
+ 	if [ "$mode" = "router" ]; then
+-		local wan_up wan_ip
++		local wan_up wan_ip uplink_dev
+ 		wan_up=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.up" 2>/dev/null)
+ 		wan_ip=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
+-		if [ "$wan_up" != "true" ] || [ -z "$wan_ip" ]; then
++		uplink_dev=$(get_uplink_device)
++		# A default route also proves routed mode when the logical interface is named wwan.
++		if { [ "$wan_up" != "true" ] || [ -z "$wan_ip" ]; } && [ -z "$uplink_dev" ]; then
+ 			mode="ap"
+ 			reason="no_wan"
+ 		fi
+@@ -616,9 +637,10 @@
+ 			case "$gw" in
+ 				192.168.*.*|10.*.*.*)
+ 					# Only treat as AP if we have no public WAN IP
+-					local wan_ip2
++					local wan_ip2 uplink_dev
+ 					wan_ip2=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
+-					if [ -z "$wan_ip2" ]; then
++					uplink_dev=$(get_uplink_device)
++					if [ -z "$wan_ip2" ] && [ -z "$uplink_dev" ]; then
+ 						mode="ap"
+ 						reason="local_gateway"
+ 					fi
+@@ -636,15 +658,23 @@
+ 	local wan_status
+ 	wan_status=$(ubus call network.interface.wan status 2>/dev/null)
+ 
+-	if [ -z "$wan_status" ]; then
+-		echo '{"available":false}'
+-		return
+-	fi
+-
+ 	local up l3_device uptime
+ 	up=$(echo "$wan_status" | jsonfilter -e "@.up" 2>/dev/null)
+ 	l3_device=$(echo "$wan_status" | jsonfilter -e "@.l3_device" 2>/dev/null)
+ 	uptime=$(echo "$wan_status" | jsonfilter -e "@.uptime" 2>/dev/null)
++	local active_device
++	active_device=$(get_uplink_device)
++	if [ -n "$active_device" ] && { [ "$up" != "true" ] || [ "$l3_device" != "$active_device" ]; }; then
++		l3_device=$active_device
++		uptime=0
++		up=false
++		[ "$(cat "/sys/class/net/$l3_device/operstate" 2>/dev/null)" = "up" ] && up=true
++		[ "$(cat "/sys/class/net/$l3_device/carrier" 2>/dev/null)" = "1" ] && up=true
++	fi
++	if [ -z "$l3_device" ]; then
++		echo '{"available":false}'
++		return
++	fi
+ 
+ 	# Get device-level statistics via ip -s link
+ 	local rx_bytes=0 tx_bytes=0 rx_errors=0 tx_errors=0 rx_dropped=0 tx_dropped=0 collisions=0
+@@ -1173,23 +1203,24 @@
+ 	local wan_mbps=0
+ 	local tx_file="/tmp/npu-wan-tx.prev"
+ 	local wan_dev
+-	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
++	wan_dev=$(get_uplink_device)
+ 
+ 	if [ -n "$wan_dev" ]; then
+-		local cur_tx
++		local cur_tx cur_time
+ 		cur_tx=$(cat "/sys/class/net/${wan_dev}/statistics/tx_bytes" 2>/dev/null || echo 0)
++		cur_time=$(date +%s)
+ 		if [ -f "$tx_file" ]; then
+-			local prev_tx prev_time cur_time elapsed delta
+-			prev_tx=$(awk '{print $1}' "$tx_file" 2>/dev/null || echo 0)
+-			prev_time=$(awk '{print $2}' "$tx_file" 2>/dev/null || echo 0)
+-			cur_time=$(date +%s)
+-			elapsed=$(( cur_time - prev_time ))
+-			if [ "$elapsed" -gt 0 ] && [ "$cur_tx" -ge "$prev_tx" ]; then
+-				delta=$(( cur_tx - prev_tx ))
+-				wan_mbps=$(( delta * 8 / elapsed / 1000000 ))
++			local prev_dev prev_tx prev_time elapsed delta
++			read -r prev_dev prev_tx prev_time < "$tx_file" ||:
++			if [ "$prev_dev" = "$wan_dev" ] && [ -n "$prev_time" ]; then
++				elapsed=$(( cur_time - prev_time ))
++				if [ "$elapsed" -gt 0 ] && [ "$cur_tx" -ge "$prev_tx" ]; then
++					delta=$(( cur_tx - prev_tx ))
++					wan_mbps=$(( delta * 8 / elapsed / 1000000 ))
++				fi
+ 			fi
+ 		fi
+-		printf "%s %s" "$cur_tx" "$(date +%s)" > "$tx_file"
++		printf "%s %s %s" "$wan_dev" "$cur_tx" "$cur_time" > "$tx_file"
+ 	fi
+ 
+ 	# Determine NPU path status using PPE bound entries as ground truth
+@@ -1219,7 +1250,7 @@
+ 
+ 	local cake_on_wan="false"
+ 	local wan_dev
+-	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
++	wan_dev=$(get_uplink_device)
+ 	if [ -n "$wan_dev" ] && command -v tc > /dev/null 2>&1; then
+ 		if tc qdisc show dev "$wan_dev" 2>/dev/null | grep -q "^qdisc cake"; then
+ 			cake_on_wan="true"
