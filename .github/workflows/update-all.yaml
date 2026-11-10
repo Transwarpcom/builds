@@ -5,7 +5,7 @@ on:
     - cron: '22 * * * *'
   workflow_dispatch:
 
-permissions: {actions: write, contents: read}
+permissions: {actions: write, contents: write}
 
 env:
   REMOTE_REPOSITORY: OpenWRT-fanboy/OpenW1700k
@@ -24,7 +24,7 @@ jobs:
 
       - name: Cache openwrt head SHA
         id: cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@v5
         with:
           path: .openwrt_head_sha
           key: openwrt-head-${{ steps.check.outputs.head_sha }}
@@ -60,11 +60,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        environment: [main, snapshot, ubi2-oc-auto]
+        environment: [main, snapshot, ubi2-oc, kernel74-oc]
     environment: ${{ matrix.environment }}
     steps:
       - name: Checkout remote repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@main
         with:
           repository: ${{ env.REMOTE_REPOSITORY }}
           ref: ${{ matrix.environment }}
@@ -77,4 +77,11 @@ jobs:
           git remote add openwrt https://github.com/openwrt/openwrt.git
           git remote update
           git rebase openwrt/main
-          git push --force-with-lease
+          git push --set-upstream origin ${{ matrix.environment }} --force-with-lease
+      - name: Sync non-oc branches
+        if: endsWith(matrix.environment, '-oc')
+        run: |
+          BASE_BRANCH=$(echo "${{ matrix.environment }}" | sed 's/-oc$//')
+          git switch -c $BASE_BRANCH
+          git reset --hard HEAD~1
+          git push --set-upstream origin $BASE_BRANCH --force-with-lease

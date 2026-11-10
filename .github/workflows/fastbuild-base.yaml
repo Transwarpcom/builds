@@ -3,52 +3,45 @@ on:
   schedule:
     -   cron: '42 09 * * *'
   workflow_dispatch:
-permissions:
-  contents: write
-  packages: write
+permissions: write-all
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-24.04-arm
-    strategy: {fail-fast: false, matrix: {target: [ubi2-oc, ubi2, SNAPSHOT]}}
+    runs-on: ubuntu-26.04-arm
+    strategy: {fail-fast: false, matrix: {target: [kernel74-oc, kernel74, ubi2-oc, ubi2, SNAPSHOT]}}
     env:
       DK_OPENWRT: /bld/openwrt
       DK_BIN: /bld/openwrt_bin
       DK_USER: /bld/user
       DK_PROFILE: /bld/user/current
       GH_TOKEN: ${{ github.token }}
-      IMG_BASE: ghcr.io/transwarpcom/${{ github.event.repository.name }}:base-builder-${{ matrix.target }}
-      IMG_INC: ghcr.io/transwarpcom/${{ github.event.repository.name }}:${{ matrix.target }}-inc
+      IMG_BASE: ghcr.io/w1700k/fastbuild_base:base-builder-${{ matrix.target }}
+      IMG_INC: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ matrix.target }}-inc
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - uses: actions/checkout@v7
 
-    - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+    - uses: docker/login-action@v4
       with: {registry: ghcr.io, username: '${{ github.actor }}', password: '${{ github.token }}'}
 
     - name: Seed caches from toolchain
       run: |
         mkdir -p openwrt_bin ghcache stcache dlcache
         if [ -z "$(ls -A ghcache 2>&-)" ] || [ -z "$(ls -A stcache 2>&-)" ]; then
-          I=ghcr.io/transwarpcom/${{ github.event.repository.name }}:base-toolcache-${{ matrix.target }}
-          if ! docker pull "$I"; then
-            I=ghcr.io/w1700k/fastbuild_base:base-toolcache-${{ matrix.target }}
-            docker pull "$I" || I=
-          fi
-          if [ -n "$I" ]; then docker create --name CA "$I" >/dev/null; for d in ghcache stcache; do docker cp CA:/$d/. "$d"; done; fi
+          I=ghcr.io/w1700k/fastbuild_base:base-toolcache-${{ matrix.target }}
+          docker pull $I 2>&- && { docker create --name CA $I >/dev/null; for d in ghcache stcache; do docker cp CA:/$d/. $d; done; }
         fi
 
     - name: Initialize environment
       run: |
         mkdir -p openwrt_bin ghcache stcache dlcache
-        bash .github/scripts/fetch-distfeeds.sh user/default/files
+        curl -Z --create-dirs -Lo user/default/files/etc/apk/repositories.d/distfeeds.list https://w1700k.github.io/builds/distfeeds.list
+        curl -Z -Lo user/default/files/etc/vermagic.txt https://w1700k.github.io/builds/vermagic.txt
         sudo tee /etc/docker/daemon.json <<< '{"max-concurrent-downloads":50,"max-concurrent-uploads":50,"experimental":true}'
         sudo systemctl reload docker
         [ -f "user/${{ matrix.target }}/config.diff" ] || { echo "::error::config.diff not found for ${{ matrix.target }}"; exit 1; }
         rsync -aI --mkpath user/default/ user/${{ matrix.target }}/ user/current/ 2>&-
         echo 'CONFIG_CCACHE_DIR="/ghcache"' >> user/current/config.diff
-        IMAGE=ghcr.io/transwarpcom/${{ github.event.repository.name }}:base-toolchain-${{ matrix.target }}
-        docker pull "$IMAGE" || { IMAGE=ghcr.io/w1700k/fastbuild_base:base-toolchain; docker pull "$IMAGE"; }
-        docker run -dt --name DK -v $PWD/user:$DK_USER -v $PWD/openwrt_bin:$DK_BIN -v $PWD/ghcache:/ghcache -v $PWD/stcache:/stcache -v $PWD/dlcache:/dlcache "$IMAGE"
+        docker run -dt --name DK -v $PWD/user:$DK_USER -v $PWD/openwrt_bin:$DK_BIN -v $PWD/ghcache:/ghcache -v $PWD/stcache:/stcache -v $PWD/dlcache:/dlcache ghcr.io/w1700k/fastbuild_base:base-toolchain-${{ matrix.target }}
         install -m 755 /dev/stdin /usr/local/bin/docker_exec <<'DKR'
         #!/bin/bash
         for n in DK_BIN DK_USER DK_PROFILE DK_OPENWRT; do e+=(-e "$n=${!n}"); done
@@ -65,65 +58,58 @@ jobs:
           cd $DK_OPENWRT
           if [ ! -d .git ]; then git init; fi
           git remote set-url origin $REPO_URL 2>&- || git remote add origin $REPO_URL
-          git fetch origin "$REPO_BRANCH"
-          if [ -n "${REPO_COMMIT:-}" ]; then git checkout --force --detach "$REPO_COMMIT"; else git checkout --force --detach FETCH_HEAD; fi
-          git clean -fdx -- files
-          mkdir -p files
-          {
-            echo "Build profile: ${{ matrix.target }}"
-            echo "Builds repository commit: ${{ github.sha }}"
-            echo "OpenWrt repository: $REPO_URL"
-            echo "OpenWrt branch: $REPO_BRANCH"
-            echo "OpenWrt commit: $(git rev-parse HEAD)"
-          } > files/build_info
+          git fetch && git checkout $REPO_BRANCH && git pull --rebase
+          { git log origin/main..$REPO_BRANCH --oneline || echo "(no commits ahead of main)"; } > files/build_info
           mountpoint $DK_BIN || { echo "::error::not mounted" >&2; exit 1; }
+          cp files/build_info $DK_BIN
           ln -sf $DK_BIN bin && ln -sf /dlcache dl && ln -sf /stcache staging_dir
           bp=$DK_PROFILE fc=feeds.conf
-          rm -f "$fc"
-          if [ -f "$bp/files/$fc" ]; then cp "$bp/files/$fc" "$fc"; fi
-          rm -rf feeds/* &>/dev/null
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          if [ -f $bp/files/$fc ]; then cp $bp/files/$fc $fc; elif [ -f feeds.conf.default ]; then cp feeds.conf.default $fc; else echo "::error::no $fc in profile files/ nor repo default" >&2; exit 1; fi
+          cp $fc /tmp/feeds.bak
+          rm -rf feeds package/feeds &>/dev/null; ./scripts/feeds update -a &>/dev/null; ./scripts/feeds install -a
+          mv /tmp/feeds.bak $fc &>/dev/null ||:
           cp $bp/config.diff .config
-          if [ -d "$bp/patches" ]; then
-            shopt -s nullglob
-            for p in "$bp"/patches/*.patch; do patch --batch --forward -d . -p1 < "$p"; done
-          fi
-          if [ -d "$bp/files" ]; then cp -r "$bp"/files/ .; fi
-          if [ -f "$bp/files/feeds.conf" ]; then rm -f files/feeds.conf; fi
-          if [ -f "$bp/custom.sh" ]; then bash -e "$bp/custom.sh"; fi
-          {
-            echo "Profile input file SHA256 values:"
-            find "$bp" -type f -print0 | sort -z | xargs -0 -r sha256sum
-            echo "Resolved feed commits:"
-            for feed in feeds/*; do
-              if [ -d "$feed/.git" ]; then printf "  %s %s\n" "${feed#feeds/}" "$(git -C "$feed" rev-parse HEAD)"; fi
-            done
-          } >> files/build_info
-          cp files/build_info "$DK_BIN/build_info"
+          cat $bp/patches/*.patch 2>&- | patch -d . -p0 --forward ||:
+          cp -r $bp/files/ . &>/dev/null ||:
+          bash $bp/custom.sh &>/dev/null ||:
           make defconfig; echo "CONFIG_VERSION_NUMBER=${{ matrix.target }}" >> .config
-          set -o pipefail
-          make download -j8 2>&1 | tee /tmp/openwrt-download.log
-          if grep -q "ERROR:" /tmp/openwrt-download.log; then echo "::error::Download log contains errors"; exit 1; fi
+          umask 022
+          grep -qF -- "--no-same-permissions -xf " include/download.mk || sed -i "s/-xf /--no-same-permissions -xf /" include/download.mk
+          make download -j8 2>&1 | tee /dev/stderr | grep -q "ERROR:" || [ $PIPESTATUS -ne 0 ] && exit 1 ||:
+          git checkout -- include/download.mk ||:
         '
 
     - name: Compile OpenWrt
       run: |
-        touch openwrt_bin/.build-start
-        build_ok=0
         for mode in c s; do
-          if docker_exec -e MODE="$mode" DK bash -e -c '
-            if [ -f "$DK_PROFILE/pre_compile.sh" ]; then bash -e "$DK_PROFILE/pre_compile.sh"; fi
-            cd "$DK_OPENWRT"
-            export FORCE_UNSAFE_CONFIGURE=1 CCACHE_SLOPPINESS=file_stat_matches,include_file_mtime,time_macros CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content
-            make -j$(($(nproc) + 1)) V=$MODE
-            if [ -x staging_dir/host/bin/ccache ]; then staging_dir/host/bin/ccache -d /ghcache -sz ||:; fi
-          '; then build_ok=1; break; fi
+          if docker_exec -e MODE=$mode DK bash -e -c '
+            umask 022
+            export TAR_OPTIONS="--no-same-permissions"
+            bash $DK_PROFILE/pre_compile.sh 2>&- ||:
+            cd $DK_OPENWRT
+            export FORCE_UNSAFE_CONFIGURE=1
+            export CCACHE_SLOPPINESS=file_stat_matches,include_file_mtime,time_macros
+            export CCACHE_NOHASHDIR=true
+            export CCACHE_COMPILERCHECK=content
+            if [ "$MODE" = s ]; then
+              make -j1 V=s
+            else
+              make -j$(($(nproc) + 1)) V=c
+            fi
+            staging_dir/host/bin/ccache -d /ghcache -sz ||:
+          '; then
+            break
+          fi
         done
-        [ "$build_ok" -eq 1 ] || { echo "::error::OpenWrt compilation failed"; exit 1; }
 
     - name: Create release
-      run: bash .github/scripts/publish-firmware.sh "${{ matrix.target }}"
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" openwrt_bin stcache
+        find -L openwrt_bin/targets/*/* -maxdepth 1 -type f -exec install -D -t firmware {} +
+        VERSION="${{ matrix.target }}_$(date +'%Y.%m.%d')_$(jq -r '.version_code' firmware/profiles.json)"
+        sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" openwrt_bin/build_info
+        gh release list --json tagName --jq '.[].tagName' | grep "^${{ matrix.target }}_" | xargs -r gh release delete --cleanup-tag -y ||:
+        gh release create $VERSION firmware/*sysupgrade.itb --title $VERSION --notes-file openwrt_bin/build_info
 
     - name: Upload builder container
       run: |
@@ -131,7 +117,7 @@ jobs:
         docker commit -a openwrt-fastbuild -m "Building at $(date)" DK $IMG_BASE
         docker push $IMG_BASE
         docker buildx imagetools create -t $IMG_INC $IMG_BASE
-        IMAGE="ghcr.io/transwarpcom/${{ github.event.repository.name }}:base-bldcache-${{ matrix.target }}"
+        IMAGE="ghcr.io/w1700k/fastbuild_base:base-bldcache-${{ matrix.target }}"
         docker build -t "$IMAGE" -f- . <<'DKR'
         FROM busybox
         COPY dlcache /dlcache
@@ -140,7 +126,21 @@ jobs:
         DKR
         docker push "$IMAGE"
 
+    - name: Delete old caches
+      if: always()
+      run: |
+        for p in dlcache. cache-${{ matrix.target }}.; do
+          gh cache list --json key,id --jq '.[] | select(.key | startswith("'"$p"'")) | .id' | xargs -r gh cache delete
+        done ||:
+
+    - uses: actions/cache/save@v5
+      if: always()
+      with: {path: "ghcache\nstcache", key: 'cache-${{ matrix.target }}.${{ github.run_id }}'}
+    - uses: actions/cache/save@v5
+      if: always()
+      with: {path: dlcache, key: 'dlcache.${{ github.run_id }}'}
+
     - name: Cleanup old ghcr images
-      uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1
+      uses: dataaxiom/ghcr-cleanup-action@v1
       with:
-        package: ${{ github.event.repository.name }}
+        package: fastbuild_base
