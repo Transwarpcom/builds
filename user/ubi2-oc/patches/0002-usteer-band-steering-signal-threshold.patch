@@ -1,0 +1,12 @@
+--- feeds/packages/net/usteer/Makefile
++++ feeds/packages/net/usteer/Makefile
+@@ -39,4 +39,9 @@
+ 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/usteerd $(1)/sbin/usteerd
+ endef
+ 
++define Build/Prepare
++	$(call Build/Prepare/Default)
++	sed -i 's/config.band_steering_signal_threshold = 5;/config.band_steering_signal_threshold = 0;/' $(PKG_BUILD_DIR)/main.c
++endef
++
+ $(eval $(call BuildPackage,usteer))
